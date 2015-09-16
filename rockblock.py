@@ -21,6 +21,13 @@ SBDIXStatus = collections.namedtuple("SBDIXStatus", ["mo", "momsn",
                                                      "mt_len", "mt_queued"])
 
 
+def parse_comma_list(txt):
+    '''
+    Parse a string of form ' a, b, c' into a list [a, b, c]
+    '''
+    return [int(elm.strip()) for elm in txt.split(",")]
+
+
 class RockBlock(object):
     '''
     An interface to a RockBlock device.
@@ -159,9 +166,9 @@ class RockBlock(object):
             rsp = self._read_response()
         self._expect_response(RSP_OK)
         if rsp[:7] == "+SBDIX:":
-            status = [int(elm.strip()) for elm in rsp[7:].split(",")]
+            status = parse_comma_list(rsp[7:])
         elif rsp[:8] == "+SBDIXA:":
-            status = [int(elm.strip()) for elm in rsp[8:].split(",")]
+            status = parse_comma_list(rsp[8:])
         else:
             logging.error("Session request failed")
             raise Exception()  # TODO: Proper exceptions
@@ -241,7 +248,7 @@ class RockBlock(object):
         rsp = self._read_response()
         if rsp[:7] == "+SBDSX:":
             self._expect_response(RSP_OK)
-            status = [int(elm.strip()) for elm in rsp[7:].split(",")]
+            status = parse_comma_list(rsp[7:])
             return SBDSXStatus(*status)
         else:
             raise Exception()  # TODO: Proper exceptions
