@@ -7,6 +7,7 @@ A module to make interfacing with a rockblock module more sane.
 '''
 import collections
 import logging
+import os
 import time
 
 import serial
@@ -35,6 +36,12 @@ class RockBlock(object):
     '''
     An interface to a RockBlock device.
     '''
+
+    def _log_msg(self, data):
+        if self.msg_log is not None:
+            self.msg_log.write(data.encode("ascii"))
+            self.msg_log.write("\n".encode("ascii"))
+            os.fdatasync(self.msg_log.fileno())
 
     def _write(self, data):
         return self.port.write(data.encode("ascii"))
@@ -106,7 +113,9 @@ class RockBlock(object):
 
         if log_file is not None:
             logging.info("Attempting to open message log file %s", log_file)
-            self.msg_log = open(log_file, "a")
+            self.msg_log = open(log_file, "ab", buffering=0)
+        else:
+            self.msg_log = None
 
         self._setup_device()
 
@@ -208,7 +217,9 @@ class RockBlock(object):
         self._write_msg_to_buffer(msg)
         self._msstm_ok()
         self._signal_ok()
-        return self._send_buffer()
+        incidental = self._send_buffer()
+        self._log_msg("---> " + msg)
+        return incidental
 
     def _read_msg_from_buffer(self, mt_len):
         self._send_command("+SBDRT")
@@ -216,7 +227,9 @@ class RockBlock(object):
         if rsp[:7] == "+SBDRT:":
             cont = self._read_response()
             if len(cont) == (mt_len + 1) and cont[-1:] == "0":
-                return cont[:-1]
+                msg = cont[:-1]
+                self._log_msg("<--- " + msg)
+                return msg
             else:
                 logging.error("Incorrect content length, expected %d, got %d\n"
                               "content: %s",
@@ -269,4 +282,5 @@ class RockBlock(object):
         Shutdown the serial connection.
         '''
         self.port.close()
-        self.msg_log.close()
+        if self.msg_log is not None:
+            self.msg_log.close()
