@@ -11,11 +11,14 @@ import time
 
 import serial
 
+# General command response codes
 RSP_OK = "0"
 
+# Status returned by +SBDSX Re: Iridium Command Ref Section 5.152
 SBDSXStatus = collections.namedtuple("SBDSXStatus", ["mo", "momsn",
                                                      "mt", "mtmsn",
                                                      "ra", "msg_waiting"])
+# Status returned by +SBDIX Re: Iridium Command Ref Section 5.144
 SBDIXStatus = collections.namedtuple("SBDIXStatus", ["mo", "momsn",
                                                      "mt", "mtmsn",
                                                      "mt_len", "mt_queued"])
