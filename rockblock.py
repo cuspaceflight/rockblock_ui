@@ -6,8 +6,10 @@ https://github.com/cuspaceflight/rockblock_ui
 A module to make interfacing with a rockblock module more sane.
 '''
 import collections
+import datetime
 import logging
 import os
+import sys
 import time
 
 import serial
@@ -25,6 +27,10 @@ SBDIXStatus = collections.namedtuple("SBDIXStatus", ["mo", "momsn",
                                                      "mt_len", "mt_queued"])
 
 
+def utc_timestamp():
+    return datetime.utcnow().isoformat()
+
+
 def parse_comma_list(txt):
     '''
     Parse a string of form ' a, b, c' into a list [a, b, c]
@@ -38,7 +44,10 @@ class RockBlock(object):
     '''
 
     def _log_msg(self, data):
+        logging.info(data)
         if self.msg_log is not None:
+            self.msg_log.write(utc_timestamp().encode("ascii"))
+            self.msg_log.write(" ".encode("ascii"))
             self.msg_log.write(data.encode("ascii"))
             self.msg_log.write("\n".encode("ascii"))
             os.fdatasync(self.msg_log.fileno())
@@ -108,11 +117,9 @@ class RockBlock(object):
 
     def __init__(self, serial_port, log_file=None):
         super(RockBlock, self).__init__()
-        logging.info("Attemting to connect to serial device %s", serial_port)
         self.port = serial.Serial(serial_port, 19200, timeout=5)
 
         if log_file is not None:
-            logging.info("Attempting to open message log file %s", log_file)
             self.msg_log = open(log_file, "ab", buffering=0)
         else:
             self.msg_log = None
@@ -284,3 +291,46 @@ class RockBlock(object):
         self.port.close()
         if self.msg_log is not None:
             self.msg_log.close()
+
+
+def recv_loop(rb):
+    while recv_loop.run:
+        rb.recv_all()
+        time.sleep(10)
+recv_loop.run = True
+
+
+def usage():
+    print("Rockblock command module")
+    print("Usage:")
+    print("  rockblock send \"Message to be sent\"")
+    print("  rockblock recv")
+
+
+def main():
+    logging.basicConfig(level=logging.INFO)
+    if "RBUI_PORT" not in os.environ:
+        print("Please set the RBUI_PORT env variable to the location of the "
+              "rockblock serial port.")
+        return
+    if "RBUI_LOG" not in os.environ:
+        print("Please set the RBUI_LOG env variable to the location of the "
+              "message log file.")
+        return
+    if len(sys.argv) < 2:
+        usage()
+        return
+    command = sys.argv[1]
+    if command not in ['send', 'recv']:
+        usage()
+        return
+    rb = RockBlock(os.environ["RBUI_PORT"], os.environ["RBUI_LOG"])
+    if command == 'send':
+        rb.send_recv(sys.argv[2])
+    else:
+        recv_loop(rb)
+    rb.close()
+
+
+if __name__ == "__main__":
+    main()
