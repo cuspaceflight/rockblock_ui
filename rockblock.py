@@ -5,11 +5,11 @@ https://github.com/cuspaceflight/rockblock_ui
 
 A module to make interfacing with a rockblock module more sane.
 '''
+import argparse
 import collections
 import datetime
 import logging
 import os
-import sys
 import time
 
 import serial
@@ -300,15 +300,23 @@ def recv_loop(rb):
 recv_loop.run = True
 
 
-def usage():
-    print("Rockblock command module")
-    print("Usage:")
-    print("  rockblock send \"Message to be sent\"")
-    print("  rockblock recv")
-
-
 def main():
     logging.basicConfig(level=logging.INFO)
+
+    parser = argparse.ArgumentParser(description="RockBLOCK interface module")
+    parser.add_argument("--debug", action="store_true")
+    sub = parser.add_subparsers()
+    sub.required = True  # Bug http://bugs.python.org/issue9253#msg186387
+    sub.dest = "cmd"
+    sub.add_parser("recv")
+    send = sub.add_parser("send")
+    send.add_argument("msg")
+
+    args = parser.parse_args()
+
+    if args.debug:
+        logging.getLogger().setLevel(logging.DEBUG)
+
     if "RBUI_PORT" not in os.environ:
         print("Please set the RBUI_PORT env variable to the location of the "
               "rockblock serial port.")
@@ -317,17 +325,11 @@ def main():
         print("Please set the RBUI_LOG env variable to the location of the "
               "message log file.")
         return
-    if len(sys.argv) < 2:
-        usage()
-        return
-    command = sys.argv[1]
-    if command not in ['send', 'recv']:
-        usage()
-        return
+
     rb = RockBlock(os.environ["RBUI_PORT"], os.environ["RBUI_LOG"])
-    if command == 'send':
-        rb.send_recv(sys.argv[2])
-    else:
+    if args.cmd == 'send':
+        rb.send_recv(args.msg)
+    elif args.cmd == 'recv':
         recv_loop(rb)
     rb.close()
 
