@@ -46,10 +46,9 @@ class RockBlock(object):
     def _log_msg(self, data):
         logging.info(data)
         if self.msg_log is not None:
-            self.msg_log.write(utc_timestamp().encode("ascii"))
-            self.msg_log.write(" ".encode("ascii"))
-            self.msg_log.write(data.encode("ascii"))
-            self.msg_log.write("\n".encode("ascii"))
+            log_msg = "{ts} {data}\n".format(ts=utc_timestamp(),
+                                             data=data)
+            self.msg_log.write(log_msg.encode("ascii"))
             os.fdatasync(self.msg_log.fileno())
 
     def _write(self, data):
