@@ -290,6 +290,11 @@ class RockBlock(object):
         incidental_recv = []
         SESSION_RETRIES = 3
         SESSION_DELAY = 1
+
+        # Check that there are no message left in the recv buffer
+        if self._check_status().mt == 1:
+            incidental_recv.append(self._read_msg_from_buffer())
+
         for _ in range(SESSION_RETRIES):
             status = self._session()
             if status.mt == 1:
