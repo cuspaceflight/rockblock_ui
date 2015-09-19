@@ -246,7 +246,7 @@ class RockBlock(object):
             if i < TIME_RETRIES-1:
                 time.sleep(TIME_DELAY)
         else:
-            raise RBTimeoutError("Network tiem query", TIME_RETRIES)
+            raise RBTimeoutError("Network time query", TIME_RETRIES)
         logging.info("Network time OK")
 
     def _signal_ok(self):
