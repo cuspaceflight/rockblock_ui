@@ -5,7 +5,6 @@ https://github.com/cuspaceflight/rockblock_ui
 
 A module to make interfacing with a rockblock module more sane.
 '''
-import argparse
 import collections
 import datetime
 import logging
@@ -17,6 +16,11 @@ import serial
 # General command response codes
 RSP_OK = "0"
 
+# Buffer IDs
+MO_BUF = "0"
+MT_BUF = "1"
+ALL_BUF = "2"
+
 # Status returned by +SBDSX Re: Iridium Command Ref Section 5.152
 SBDSXStatus = collections.namedtuple("SBDSXStatus", ["mo", "momsn",
                                                      "mt", "mtmsn",
@@ -27,8 +31,59 @@ SBDIXStatus = collections.namedtuple("SBDIXStatus", ["mo", "momsn",
                                                      "mt_len", "mt_queued"])
 
 
+class RockBlockException(Exception):
+    def __init__(self, *args, **kwargs):
+        super(RockBlockException, self).__init__(*args, **kwargs)
+
+
+class RBTimeoutError(RockBlockException):
+    def __init__(self, query, num):
+        super(RBTimeoutError, self).__init__()
+        self.query = query
+        self.num = num
+
+    def __str__(self):
+        return "{} timed out after {:d} attempts".format(self.query, self.num)
+
+
+class DeviceError(RockBlockException):
+    def __init__(self, error, rsp):
+        super(DeviceError, self).__init__(error,
+                                          rsp.encode("unicode_escape"))
+
+
+class ExpectationFailure(RockBlockException):
+    def __init__(self, expected, actual):
+        super(ExpectationFailure, self).__init__()
+        self.expected = expected
+        self.actual = actual
+
+    def __str__(self):
+        return "Unexpected response, expected {}, received {}".format(
+            self.expected.encode("unicode_escape"),
+            self.actual.encode("unicode_escape"))
+
+
+class MessageTooLongError(RockBlockException):
+    def __init__(self, *args, **kwargs):
+        super(MessageTooLongError, self).__init__(*args, **kwargs)
+
+
+class IncorrectContentLengthError(RockBlockException):
+    def __init__(self, length, cont):
+        super(IncorrectContentLengthError, self).__init__()
+        self.length = length
+        self.cont = cont
+
+    def __str__(self):
+        return("Unexpected content length, expected {:d}, got {:d}\n"
+               "Content: {}".format(self.length,
+                                    len(self.cont),
+                                    self.cont.encode("unicode_escape")))
+
+
 def utc_timestamp():
-    return datetime.utcnow().isoformat()
+    return datetime.datetime.utcnow().replace(microsecond=0).isoformat()
 
 
 def parse_comma_list(txt):
@@ -36,6 +91,52 @@ def parse_comma_list(txt):
     Parse a string of form ' a, b, c' into a list [a, b, c]
     '''
     return [int(elm.strip()) for elm in txt.split(",")]
+
+
+class ATModem(object):
+    def __init__(self, serial_port):
+        self.port = serial.Serial(serial_port, 19200, timeout=5)
+
+    def _raw_write(self, msg):
+        return self.port.write(msg.encode("ascii"))
+
+    def _raw_read(self):
+        return self.port.readline().decode("ascii")
+
+    def command(self, cmd):
+        command = "AT" + cmd + "\r"
+        logging.debug("Issuing command %s", command.encode("unicode_escape"))
+        self._raw_write(command)
+
+    def response(self, expect=None, retry=0):
+        '''
+        If expect is not None then it will throw an exception
+        if the response does not match except.
+        If retry is non-zero, it will retry the read until the value
+        is not '', upto retry times.
+        If both are given it will retry and if it gets a valid result
+        it will check it against except.
+        '''
+        rsp = self._raw_read()
+
+        for i in range(retry):
+            if rsp != "":
+                break
+            rsp = self._raw_read()
+
+        if rsp == "":
+            raise RBTimeoutError("Read", retry)
+
+        rsp = rsp.strip()
+
+        logging.debug("Received response %s", rsp.encode("unicode_escape"))
+
+        if expect is not None and rsp != expect:
+            raise ExpectationFailure(expect, rsp)
+        return rsp
+
+    def close(self):
+        self.port.close()
 
 
 class RockBlock(object):
@@ -46,77 +147,53 @@ class RockBlock(object):
     def _log_msg(self, data):
         logging.info(data)
         if self.msg_log is not None:
-            log_msg = "{ts} {data}\n".format(ts=utc_timestamp(),
-                                             data=data)
+            log_msg = "{ts} {data}\n".format(ts=utc_timestamp(), data=data)
             self.msg_log.write(log_msg.encode("ascii"))
             os.fdatasync(self.msg_log.fileno())
 
-    def _write(self, data):
-        return self.port.write(data.encode("ascii"))
-
-    def _read_line(self):
-        return self.port.readline().decode("ascii")
-
-    def _send_command(self, command):
-        '''
-        Send command to the device after wrapping it in AT syntax.
-        '''
-        command = "AT" + command + "\r"
-        logging.debug("Issuing command %s", command.encode("unicode_escape"))
-        self._write(command)
-
-    def _read_response(self):
-        rsp = self._read_line().strip()
-        logging.debug("Received response %s", rsp.encode("unicode_escape"))
-        return rsp
-
-    def _expect_response(self, value):
-        '''
-        Query the device for a response and evaluate that it matches the
-        expected return.
-        '''
-        rsp = self._read_response()
-        if rsp != value:
-            logging.error("Expected response %s, got %s instead",
-                          value.encode("unicode_escape"),
-                          rsp.encode("unicode_escape"))
-            raise Exception()  # TODO: Proper exceptions
-
     def _setup_device(self):
         # Check device verbose and echo settings
-        self._send_command("")  # Empty AT command
-        rsp = self._read_response()
+        self.mod.command("")  # Empty AT command
+        rsp = self.mod.response()
         if rsp == "0":
             echo = False
             verbose = False
         elif rsp == "AT\r0":
             echo = True
             verbose = False
-        elif rsp == "AT":
-            echo = True
-            verbose = True
-        elif rsp == "":
-            echo = False
-            verbose = True
+        elif rsp == "AT" or rsp == "":
+            rspp = self.mod.response()
+            if rspp == "OK":
+                echo = True
+                verbose = True
+            else:
+                echo = False
+                verbose = True
 
         if echo:
-            self._send_command("E0")  # Disable command echos
+            self.mod.command("E0")  # Disable command echos
             if verbose:
-                self._expect_response("ATE0")  # Last of those
-                self._expect_response("OK")
+                self.mod.response(expect="ATE0")  # Last of those
+                self.mod.response(expect="OK")
             else:
-                self._expect_response("ATE0\r0")  # Last of those
+                self.mod.response(expect="ATE0\r0")  # Last of those
 
         if verbose:
-            self._send_command("V0")  # Disable verbose responses
-            self._expect_response(RSP_OK)
+            self.mod.command("V0")  # Disable verbose responses
+            self.mod.response(expect=RSP_OK)
 
-        self._send_command("+SBDMTA=0")  # Disable ring alerts
-        self._expect_response(RSP_OK)
+        self.mod.command("+SBDMTA=0")  # Disable ring alerts
+        self.mod.response(expect=RSP_OK)
+
+    def _reset_device(self):
+        self.mod.command("E1V1")  # Revert to echo and verbose modes
+        self.mod.response(expect="")
+        self.mod.response(expect="OK")
 
     def __init__(self, serial_port, log_file=None):
         super(RockBlock, self).__init__()
-        self.port = serial.Serial(serial_port, 19200, timeout=5)
+
+        self.mod = ATModem(serial_port)
 
         if log_file is not None:
             self.msg_log = open(log_file, "ab", buffering=0)
@@ -126,73 +203,90 @@ class RockBlock(object):
         self._setup_device()
 
     def check_sig_strength(self):
-        self._send_command("+CSQF")
-        rsp = self._read_response()
-        if rsp[:6] == "+CSQF:":
-            strength = int(rsp[6])
-            self._expect_response(RSP_OK)
-            return strength
-        else:
-            return -1
+        try:
+            self.mod.command("+CSQF")
+            rsp = self.mod.response()
+            if rsp[:6] == "+CSQF:":
+                strength = int(rsp[6])
+                self.mod.response(expect=RSP_OK)
+                return strength
+            else:
+                raise DeviceError("Error querying signal strength", rsp)
+        except RockBlockException:
+            logging.exception("")
+            raise
 
     def _write_msg_to_buffer(self, msg):
-        self._send_command("+SBDWT")
-        self._expect_response("READY")
-        self._write(msg)
-        self._write("\r")
-        self._expect_response(RSP_OK)
-        self._expect_response(RSP_OK)  # Not sure why I get two oks here
+        logging.info("Writing message to output buffer")
+        self.mod.command("+SBDWT")
+        self.mod.response(expect="READY")
+        self.mod._raw_write(msg)
+        self.mod._raw_write("\r")
+        self.mod.response(expect=RSP_OK)
+        self.mod.response(expect=RSP_OK)  # Not sure why I get two oks here
+        logging.info("Message written")
 
     def _check_msstm(self):
-        self._send_command("-MSSTM")
-        rsp = self._read_response()
-        self._expect_response(RSP_OK)
+        logging.info("Checking network time")
+        self.mod.command("-MSSTM")
+        rsp = self.mod.response()
+        self.mod.response(expect=RSP_OK)
         if rsp[:7] == "-MSSTM:":
             return rsp[8:] != "no network service"
         else:
-            raise Exception()  # TODO: Proper exceptions
+            raise DeviceError("Error querying network time", rsp)
 
     def _msstm_ok(self):
         TIME_RETRIES = 20
         TIME_DELAY = 1
-        for _ in range(TIME_RETRIES):
+        for i in range(TIME_RETRIES):
             if self._check_msstm():
                 break
-            time.sleep(TIME_DELAY)
+            logging.info("Network time FAIL")
+            if i < TIME_RETRIES-1:
+                time.sleep(TIME_DELAY)
         else:
-            logging.error("Timed out due to invalid MSSTM")
-            raise Exception()  # TODO: Proper exceptions
+            raise RBTimeoutError("Network tiem query", TIME_RETRIES)
+        logging.info("Network time OK")
 
     def _signal_ok(self):
+        logging.info("Checking signal availability")
         SIGNAL_RETRIES = 3
         SIGNAL_DELAY = 10
-        for _ in range(SIGNAL_RETRIES):
-            if self.check_sig_strength() >= 2:
+        for i in range(SIGNAL_RETRIES):
+            sig = self.check_sig_strength()
+            if sig >= 2:
                 break
-            time.sleep(SIGNAL_DELAY)
+            logging.info("Signal %d/5 FAIL", sig)
+            if i < SIGNAL_RETRIES-1:
+                time.sleep(SIGNAL_DELAY)
         else:
-            logging.error("Timed out due to insufficient signal strength")
-            raise Exception()  # TODO: Proper exceptions
+            raise RBTimeoutError("Signal strength query", SIGNAL_RETRIES)
+        logging.info("Signal %d/5 OK", sig)
 
     def _session(self, a=False):
         if a:
-            self._send_command("+SBDIXA")
+            self.mod.command("+SBDIXA")
         else:
-            self._send_command("+SBDIX")
-        rsp = self._read_response()
-        while rsp == "":
-            rsp = self._read_response()
-        self._expect_response(RSP_OK)
+            self.mod.command("+SBDIX")
+        rsp = self.mod.response(retry=5)
+        self.mod.response(expect=RSP_OK)
         if rsp[:7] == "+SBDIX:":
-            status = parse_comma_list(rsp[7:])
+            status = SBDIXStatus(*parse_comma_list(rsp[7:]))
         elif rsp[:8] == "+SBDIXA:":
-            status = parse_comma_list(rsp[8:])
+            status = SBDIXStatus(*parse_comma_list(rsp[8:]))
         else:
-            logging.error("Session request failed")
-            raise Exception()  # TODO: Proper exceptions
-        return SBDIXStatus(*status)
+            raise DeviceError("Error initiating satellite session", rsp)
+        logging.debug(status)
+        return status
+
+    def _clear_buffer(self, buf_id):
+        self.mod.command("+SBDD{}".format(buf_id))
+        self.mod.response(expect=RSP_OK)
+        self.mod.response(expect=RSP_OK)  # Another mystery double ok
 
     def _send_buffer(self):
+        logging.info("Establishing session with satellite")
         incidental_recv = []
         SESSION_RETRIES = 3
         SESSION_DELAY = 1
@@ -205,133 +299,108 @@ class RockBlock(object):
                 break
             time.sleep(SESSION_DELAY)
         else:
-            logging.error("Timed out due to failed session")
-            raise Exception()  # TODO: Proper exceptions
-        self._send_command("+SBDD0")
-        self._expect_response(RSP_OK)
-        self._expect_response(RSP_OK)  # Another mystery double ok
+            raise RBTimeoutError("Buffer send", SESSION_RETRIES)
+        self._clear_buffer(MO_BUF)
         return incidental_recv
+
+    def _recv_buffer(self, a):
+        logging.info("Establishing session with satellite")
+        SESSION_RETRIES = 3
+        SESSION_DELAY = 1
+        for _ in range(SESSION_RETRIES):
+            status = self._session(a)
+            if status.mt == 1:
+                break
+            time.sleep(SESSION_DELAY)
+        else:
+            raise RBTimeoutError("Buffer recv", SESSION_RETRIES)
+        recv = self._read_msg_from_buffer(status.mt_len)
+        return recv
 
     def send_recv(self, msg):
         '''
         Send a message to the device, return any messages received during the
         sending process.
         '''
-        if len(msg) > 360:
-            logging.error("Message too long, maximum send size is 360 bytes")
-            raise Exception()  # TODO: Proper exceptions
-        self._write_msg_to_buffer(msg)
-        self._msstm_ok()
-        self._signal_ok()
-        incidental = self._send_buffer()
-        self._log_msg("---> " + msg)
-        return incidental
+        try:
+            if len(msg) > 360:
+                raise MessageTooLongError("Maximum send size is 360 bytes")
+            self._write_msg_to_buffer(msg)
+            self._msstm_ok()
+            self._signal_ok()
+            incidental = self._send_buffer()
+            self._log_msg("---> " + msg)
+            return incidental
+        except RockBlockException:
+            logging.exception("")
+            raise
 
-    def _read_msg_from_buffer(self, mt_len):
-        self._send_command("+SBDRT")
-        rsp = self._read_response()
+    def _read_msg_from_buffer(self, mt_len=-1):
+        logging.info("Reading message from buffer")
+        self.mod.command("+SBDRT")
+        rsp = self.mod.response()
         if rsp[:7] == "+SBDRT:":
-            cont = self._read_response()
-            if len(cont) == (mt_len + 1) and cont[-1:] == "0":
+            cont = self.mod.response()
+            if cont[-1:] == "0" and (mt_len == -1 or
+                                     len(cont) == (mt_len + 1)):
                 msg = cont[:-1]
                 self._log_msg("<--- " + msg)
+                self._clear_buffer(MT_BUF)
                 return msg
             else:
-                logging.error("Incorrect content length, expected %d, got %d\n"
-                              "content: %s",
-                              mt_len,
-                              len(cont),
-                              cont.encode("unicode_escape"))
-                raise Exception()  # TODO: Proper exceptions
+                raise IncorrectContentLengthError(mt_len, cont)
         else:
-            logging.error("Failed to receive message correctly")
-            raise Exception()  # TODO: Proper exceptions
+            raise DeviceError("Error reading message from device buffer", rsp)
 
     def recv_all(self):
         '''
         Receive all messages waiting, return them as a list.
         '''
-        status = self._check_status()
-        recv = []
-        while self.msg_waiting(status):
-            self._msstm_ok()
-            self._signal_ok()
-            sesh_status = self._session(a=status.ra)
-            if sesh_status.mt == 1:
-                recv.append(self._read_msg_from_buffer(sesh_status.mt_len))
-            else:
-                logging.error("Failed to receive message correctly")
-                raise Exception()  # TODO: Proper exceptions
+        try:
             status = self._check_status()
-        return recv
+            recv = []
+            while self.msg_waiting(status):
+                logging.info("Messages waiting to be received")
+                if status.mt == 1:
+                    recv.append(self._read_msg_from_buffer())
+                else:
+                    self._msstm_ok()
+                    self._signal_ok()
+                    recv.append(self._recv_buffer(a=status.ra))
+                status = self._check_status()
+            return recv
+        except RockBlockException:
+            logging.exception("")
+            raise
 
     def _check_status(self):
-        self._send_command("+SBDSX")
-        rsp = self._read_response()
+        self.mod.command("+SBDSX")
+        rsp = self.mod.response()
         if rsp[:7] == "+SBDSX:":
-            self._expect_response(RSP_OK)
-            status = parse_comma_list(rsp[7:])
-            return SBDSXStatus(*status)
+            self.mod.response(expect=RSP_OK)
+            status = SBDSXStatus(*parse_comma_list(rsp[7:]))
+            logging.debug(status)
+            return status
         else:
-            raise Exception()  # TODO: Proper exceptions
+            raise DeviceError("Error querying device status", rsp)
 
     def msg_waiting(self, status=None):
         '''
         Return True if there are messages waiting to be received.
         '''
-        if status is None:
-            status = self._check_status()
-        return status.ra == 1 or status.msg_waiting > 0
+        try:
+            if status is None:
+                status = self._check_status()
+            return status.mt == 1 or status.ra == 1 or status.msg_waiting > 0
+        except RockBlockException:
+            logging.exception("")
+            raise
 
     def close(self):
         '''
         Shutdown the serial connection.
         '''
-        self.port.close()
+        self._reset_device()
+        self.mod.close()
         if self.msg_log is not None:
             self.msg_log.close()
-
-
-def recv_loop(rb):
-    while recv_loop.run:
-        rb.recv_all()
-        time.sleep(10)
-recv_loop.run = True
-
-
-def main():
-    logging.basicConfig(level=logging.INFO)
-
-    parser = argparse.ArgumentParser(description="RockBLOCK interface module")
-    parser.add_argument("--debug", action="store_true")
-    sub = parser.add_subparsers()
-    sub.required = True  # Bug http://bugs.python.org/issue9253#msg186387
-    sub.dest = "cmd"
-    sub.add_parser("recv")
-    send = sub.add_parser("send")
-    send.add_argument("msg")
-
-    args = parser.parse_args()
-
-    if args.debug:
-        logging.getLogger().setLevel(logging.DEBUG)
-
-    if "RBUI_PORT" not in os.environ:
-        print("Please set the RBUI_PORT env variable to the location of the "
-              "rockblock serial port.")
-        return
-    if "RBUI_LOG" not in os.environ:
-        print("Please set the RBUI_LOG env variable to the location of the "
-              "message log file.")
-        return
-
-    rb = RockBlock(os.environ["RBUI_PORT"], os.environ["RBUI_LOG"])
-    if args.cmd == 'send':
-        rb.send_recv(args.msg)
-    elif args.cmd == 'recv':
-        recv_loop(rb)
-    rb.close()
-
-
-if __name__ == "__main__":
-    main()
